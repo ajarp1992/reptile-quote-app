@@ -965,6 +965,7 @@ async function submitQuote() {
         photos: photoData
       })
     });
+
     const data = await res.json();
 
     btn.classList.remove('loading');
