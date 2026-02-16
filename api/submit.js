@@ -1,119 +1,98 @@
-export default async function handler(req, res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+const { createClient } = require('@supabase/supabase-js');
 
-  if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_KEY
+);
+
+module.exports = async (req, res) => {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
 
   try {
     const { name, phone, description, photos } = req.body;
 
-    const supabaseUrl = process.env.SUPABASE_URL;
-    const supabaseKey = process.env.SUPABASE_KEY;
+    // 1. Save quote to database
+    const { data: quote, error: dbError } = await supabase
+      .from('quotes')
+      .insert([{ name, phone, description }])
+      .select()
+      .single();
 
-    let quoteId = null;
-    let photoUrls = [];
+    if (dbError) {
+      console.error('DB Error:', dbError);
+      return res.status(500).json({ success: false, error: 'Database error' });
+    }
 
-    if (supabaseUrl && supabaseKey) {
-      const quoteRes = await fetch(`${supabaseUrl}/rest/v1/quotes`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          apikey: supabaseKey,
-          Authorization: `Bearer ${supabaseKey}`,
-          Prefer: "return=representation",
-        },
-        body: JSON.stringify({
-          name: name,
-          phone: phone,
-          description: description || "",
-          photo_count: photos ? photos.length : 0,
-          created_at: new Date().toISOString(),
-        }),
-      });
+    const quoteId = quote.id;
+    const photoLinks = [];
 
-      const quoteData = await quoteRes.json();
-      if (quoteData && quoteData.length > 0) {
-        quoteId = quoteData[0].id;
-      }
+    // 2. Upload photos to Supabase Storage
+    if (photos && photos.length > 0) {
+      for (let i = 0; i < photos.length; i++) {
+        const photo = photos[i];
+        const buffer = Buffer.from(photo.data, 'base64');
+        const ext = photo.type === 'image/png' ? 'png' : 'jpg';
+        const filePath = `quote-${quoteId}/photo-${i + 1}.${ext}`;
 
-      if (quoteId && photos && photos.length > 0) {
-        for (let i = 0; i < photos.length; i++) {
-          const photo = photos[i];
-          const ext = photo.type === "image/png" ? "png" : "jpg";
-          const fileName = `quote-${quoteId}/photo-${i + 1}.${ext}`;
-
-          const binaryStr = atob(photo.data);
-          const bytes = new Uint8Array(binaryStr.length);
-          for (let j = 0; j < binaryStr.length; j++) {
-            bytes[j] = binaryStr.charCodeAt(j);
-          }
-
-          await fetch(`${supabaseUrl}/storage/v1/object/quote-photos/${fileName}`, {
-            method: "POST",
-            headers: {
-              apikey: supabaseKey,
-              Authorization: `Bearer ${supabaseKey}`,
-              "Content-Type": photo.type,
-            },
-            body: bytes,
+        const { error: uploadError } = await supabase.storage
+          .from('quote-photos')
+          .upload(filePath, buffer, {
+            contentType: photo.type,
+            upsert: true
           });
 
-          photoUrls.push(`${supabaseUrl}/storage/v1/object/public/quote-photos/${fileName}`);
+        if (uploadError) {
+          console.error('Upload Error:', uploadError);
+          continue;
         }
 
-        await fetch(`${supabaseUrl}/rest/v1/quotes?id=eq.${quoteId}`, {
-          method: "PATCH",
-          headers: {
-            "Content-Type": "application/json",
-            apikey: supabaseKey,
-            Authorization: `Bearer ${supabaseKey}`,
-            Prefer: "return=minimal",
-          },
-          body: JSON.stringify({
-            photo_urls: photoUrls,
-          }),
-        });
+        const { data: urlData } = supabase.storage
+          .from('quote-photos')
+          .getPublicUrl(filePath);
+
+        if (urlData && urlData.publicUrl) {
+          photoLinks.push(urlData.publicUrl);
+        }
+      }
+
+      // 3. Save photo URLs to database
+      if (photoLinks.length > 0) {
+        await supabase
+          .from('quotes')
+          .update({ photo_urls: photoLinks })
+          .eq('id', quoteId);
       }
     }
 
-    const pushoverToken = process.env.PUSHOVER_TOKEN;
-    const pushoverUser = process.env.PUSHOVER_USER;
-
-    if (pushoverToken && pushoverUser) {
-      let message = `Name: ${name}\nPhone: ${phone}\nProject: ${description || "(none)"}`;
-
-      if (photoUrls.length > 0) {
-        message += `\n\n${photoUrls.length} photo(s) attached:`;
-        message += `\n${photoUrls[0]}`;
-      }
-
-      const pushBody = {
-        token: pushoverToken,
-        user: pushoverUser,
-        title: `Quote #${quoteId || "new"} - ${name}`,
-        message: message,
-        sound: "cashregister",
-        priority: 1,
-        html: 1,
-      };
-
-      if (photoUrls.length > 0) {
-        pushBody.url = photoUrls[0];
-        pushBody.url_title = `View all ${photoUrls.length} photo(s)`;
-      }
-
-      await fetch("https://api.pushover.net/1/messages.json", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(pushBody),
+    // 4. Send Pushover notification
+    let message = `New Quote #${quoteId}\nName: ${name}\nPhone: ${phone}`;
+    if (description) message += `\nProject: ${description}`;
+    if (photoLinks.length > 0) {
+      message += `\n\nPhotos (${photoLinks.length}):`;
+      photoLinks.forEach((link, i) => {
+        message += `\nPhoto ${i + 1}: ${link}`;
       });
     }
 
-    return res.status(200).json({ success: true, quoteId: quoteId });
+    await fetch('https://api.pushover.net/1/messages.json', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        token: process.env.PUSHOVER_TOKEN,
+        user: process.env.PUSHOVER_USER,
+        message: message,
+        sound: 'cashregister',
+        priority: 1,
+        title: 'Rep-Tile Quote Request'
+      })
+    });
+
+    return res.status(200).json({ success: true, quoteId });
+
   } catch (err) {
-    console.error("Submit error:", err);
-    return res.status(500).json({ success: false, error: err.message });
+    console.error('Server Error:', err);
+    return res.status(500).json({ success: false, error: 'Server error' });
   }
-}
+};
