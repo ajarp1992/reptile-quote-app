@@ -939,6 +939,22 @@ async function submitQuote() {
   btn.classList.add('loading');
 
   try {
+    // Convert photos to base64
+    const photoData = [];
+    for (const file of photoFiles) {
+      const base64 = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result.split(',')[1]);
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+      photoData.push({
+        data: base64,
+        type: file.type,
+        name: file.name
+      });
+    }
+
     const res = await fetch('/api/submit', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -946,10 +962,9 @@ async function submitQuote() {
         name: name,
         phone: phone,
         description: desc || '',
-        photos: photoFiles.length
+        photos: photoData
       })
     });
-
     const data = await res.json();
 
     btn.classList.remove('loading');
